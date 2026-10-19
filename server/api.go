@@ -125,6 +125,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/assets", s.handleAssets)
 	mux.HandleFunc("/api/market-structure", s.handleMarketStructure)
 	mux.HandleFunc("/healthz", s.handleHealth)
+	mux.HandleFunc("/api/corridor/image", s.handleCorridorImage)
 	mux.Handle("/", uiHandler(s.Store))
 	return withCORS(s.limit(mux))
 }
