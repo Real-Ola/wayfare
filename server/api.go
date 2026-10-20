@@ -7,6 +7,8 @@ package server
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,6 +66,11 @@ type Server struct {
 	// it. Tests that hammer one endpoint build their own Server or call
 	// NewRateLimiter with a disabled configuration.
 	Limiter *RateLimiter
+
+	// now is the clock the handlers stamp a "generated at" field with. It is
+	// swapped in tests, which pin it so the timestamp can be frozen in a
+	// golden file; nil means time.Now, and production never sets it.
+	now func() time.Time
 }
 
 // pkgLogger is the package-level logger for request and upstream logging.
@@ -85,6 +92,15 @@ func (s *Server) timeout() time.Duration {
 		return s.Timeout
 	}
 	return 90 * time.Second
+}
+
+// clock returns the current time in UTC. It reads the swappable now field so
+// a test can pin the clock; production leaves that nil and gets time.Now.
+func (s *Server) clock() time.Time {
+	if s.now != nil {
+		return s.now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 // Live-measurement budget: a fixed allowance for the reference rate and
@@ -113,9 +129,10 @@ func (s *Server) budgetFor(n int) time.Duration {
 //
 // The limiter wraps every route, including /healthz: a deployment probe and
 // a browser page load are both requests a client chose to make, and the
-// free instance's cost is upstream calls plus CPU regardless of path. CORS
-// stays outermost so a rate-limited response still carries the origin
-// policy and remains readable to a browser client.
+// free instance's cost is upstream calls plus CPU regardless of path.
+// withGzip serves compressed responses when accepted (issue #610), skipping
+// tiny bodies. CORS stays outermost so a rate-limited or compressed response
+// still carries the origin policy and remains readable to a browser client.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/corridor", s.handleCorridor)
@@ -125,7 +142,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/market-structure", s.handleMarketStructure)
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.Handle("/", uiHandler())
-	return withCORS(s.limit(mux))
+	return withCORS(withRequestID(withGzip(s.limit(mux))))
 }
 
 // limit applies the configured rate limiter, or passes through unchanged
@@ -136,6 +153,47 @@ func (s *Server) limit(next http.Handler) http.Handler {
 		return next
 	}
 	return s.Limiter.middleware(next)
+}
+
+type contextKey string
+
+const requestIDKey contextKey = "request_id"
+
+// requestID returns the request ID from ctx, or empty string if not set.
+func requestID(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	id, _ := ctx.Value(requestIDKey).(string)
+	return id
+}
+
+// RequestID exports the request ID attached to ctx, if any.
+func RequestID(ctx context.Context) string {
+	return requestID(ctx)
+}
+
+// generateRequestID generates a 16-byte random hex string.
+func generateRequestID() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return hex.EncodeToString([]byte(fmt.Sprintf("%016x", time.Now().UnixNano())))
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// withRequestID assigns an X-Request-Id to the request if none was provided,
+// binds it to the request context, and writes it onto response headers.
+func withRequestID(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := strings.TrimSpace(r.Header.Get("X-Request-Id"))
+		if reqID == "" {
+			reqID = generateRequestID()
+		}
+		w.Header().Set("X-Request-Id", reqID)
+		ctx := context.WithValue(r.Context(), requestIDKey, reqID)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 // withCORS makes the API callable from any origin, and records the policy
@@ -157,6 +215,7 @@ func (s *Server) limit(next http.Handler) http.Handler {
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Expose-Headers", "X-Request-Id")
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
 			if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
@@ -228,6 +287,7 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 			pegBase+"/"+pegQuote); ok {
 			writeJSON(w, r, http.StatusOK, stale)
 			log().Info("corridor measured",
+				"request_id", requestID(r.Context()),
 				"method", r.Method,
 				"path", r.URL.Path,
 				"from", from,
@@ -275,6 +335,7 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 		if stale, ok := s.staleFor(ctx, sendAsset.Code, recvAsset.Code, pegBase+"/"+pegQuote); ok {
 			writeJSON(w, r, http.StatusOK, stale)
 			log().Info("corridor measured",
+				"request_id", requestID(r.Context()),
 				"method", r.Method,
 				"path", r.URL.Path,
 				"from", from,
@@ -294,14 +355,18 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 					completed = append(completed, d.String())
 				}
 			}
-			writeJSON(w, r, http.StatusGatewayTimeout, map[string]any{
+			timeoutBody := map[string]any{
 				"error": fmt.Sprintf("measuring corridor: timed out after %s with %d of %d rungs completed",
 					budget, len(completed), rungs),
 				"code":            codeUpstreamTimeout,
 				"budget":          budget.String(),
 				"rungs_requested": rungs,
 				"rungs_completed": completed,
-			})
+			}
+			if reqID := requestID(r.Context()); reqID != "" {
+				timeoutBody["request_id"] = reqID
+			}
+			writeJSON(w, r, http.StatusGatewayTimeout, timeoutBody)
 			return
 		}
 		writeError(w, r, status, code, "measuring corridor: "+err.Error())
@@ -327,6 +392,7 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 	// succeeds, not derived from the query parameter.
 	actualLive := true
 	log().Info("corridor measured",
+		"request_id", requestID(r.Context()),
 		"method", r.Method,
 		"path", r.URL.Path,
 		"from", from,
@@ -675,10 +741,14 @@ func writeJSON(w http.ResponseWriter, r *http.Request, status int, body any) {
 }
 
 func writeError(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
-	writeJSON(w, r, status, map[string]string{
+	body := map[string]string{
 		"error": msg,
 		"code":  code,
-	})
+	}
+	if reqID := requestID(r.Context()); reqID != "" {
+		body["request_id"] = reqID
+	}
+	writeJSON(w, r, status, body)
 }
 
 // staleFor returns the most recent stored run for a corridor, labelled as
@@ -1069,7 +1139,7 @@ func (s *Server) handleMarketStructure(w http.ResponseWriter, r *http.Request) {
 		IssuerConcentrations:      concentration,
 		CorridorCount:             corridorCount,
 		ConcentratedCorridorCount: concentratedCount,
-		GeneratedAt:               time.Now().UTC().Format(time.RFC3339),
+		GeneratedAt:               s.clock().Format(time.RFC3339),
 	}
 
 	writeJSON(w, r, http.StatusOK, out)
