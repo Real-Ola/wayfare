@@ -60,7 +60,7 @@ func (c CorridorImage) SVG() string {
 		`<rect width="1200" height="630" fill="url(#bg)"/>`,
 
 		label(60, 96, "WAYFARE — CORRIDOR SNAPSHOT", "#F8FAFC", 30, "700", 1),
-		label(60, 138, esc(c.Title), "#94A3B8", 22, "", 1),		big(60, 192, esc(c.Integrity), "#10B981", 88),
+		label(60, 138, esc(c.Title), "#94A3B8", 22, "", 1), big(60, 192, esc(c.Integrity), "#10B981", 88),
 		badge(60, 218, 320, 54, esc(c.Integrity), "#10B981", 30),
 
 		label(60, 312, "FLOOR LOSS", "#F59E0B", 22, "", 1),

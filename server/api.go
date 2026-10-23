@@ -7,8 +7,6 @@ package server
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,8 +51,10 @@ type Server struct {
 	// only which is tried first.
 	HistoryFirst bool
 
-	// Timeout bounds a single corridor measurement. A full ladder is a
-	// dozen round trips to Horizon, so this is generous by HTTP standards.
+	// Timeout bounds a single corridor measurement. One Horizon call per
+	// rung, plus a two-call slippage probe on each rung above the probe
+	// threshold, so the count scales with route.DefaultSizes rather than
+	// staying a fixed dozen; this is still generous by HTTP standards.
 	// It is the ceiling: the budget a request actually gets is derived from
 	// its rung count (see budgetFor) and never exceeds this.
 	Timeout time.Duration
@@ -139,13 +139,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/corridor", s.handleCorridor)
 	mux.HandleFunc("/api/corridor/trend", s.handleTrend)
 	mux.HandleFunc("/og/corridor.svg", s.handleSocialPreview)
+	mux.HandleFunc("/api/corridor/image", s.handleCorridorImage)
 	mux.HandleFunc("/api/chain-heads", s.handleChainHeads)
 	mux.HandleFunc("/api/assets", s.handleAssets)
 	mux.HandleFunc("/api/market-structure", s.handleMarketStructure)
 	mux.HandleFunc("/api/thresholds", s.handleThresholds)
 	mux.HandleFunc("/healthz", s.handleHealth)
-	mux.Handle("/", uiHandler())
-	return withCORS(withRequestID(withGzip(s.limit(mux))))
+	mux.Handle("/", s.uiHandler())
+	return withCORS(withGzip(s.limit(mux)))
 }
 
 // limit applies the configured rate limiter, or passes through unchanged
@@ -156,47 +157,6 @@ func (s *Server) limit(next http.Handler) http.Handler {
 		return next
 	}
 	return s.Limiter.middleware(next)
-}
-
-type contextKey string
-
-const requestIDKey contextKey = "request_id"
-
-// requestID returns the request ID from ctx, or empty string if not set.
-func requestID(ctx context.Context) string {
-	if ctx == nil {
-		return ""
-	}
-	id, _ := ctx.Value(requestIDKey).(string)
-	return id
-}
-
-// RequestID exports the request ID attached to ctx, if any.
-func RequestID(ctx context.Context) string {
-	return requestID(ctx)
-}
-
-// generateRequestID generates a 16-byte random hex string.
-func generateRequestID() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return hex.EncodeToString([]byte(fmt.Sprintf("%016x", time.Now().UnixNano())))
-	}
-	return hex.EncodeToString(b[:])
-}
-
-// withRequestID assigns an X-Request-Id to the request if none was provided,
-// binds it to the request context, and writes it onto response headers.
-func withRequestID(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqID := strings.TrimSpace(r.Header.Get("X-Request-Id"))
-		if reqID == "" {
-			reqID = generateRequestID()
-		}
-		w.Header().Set("X-Request-Id", reqID)
-		ctx := context.WithValue(r.Context(), requestIDKey, reqID)
-		next.ServeHTTP(w, r.WithContext(ctx))
-	})
 }
 
 // withCORS makes the API callable from any origin, and records the policy
@@ -215,10 +175,16 @@ func withRequestID(next http.Handler) http.Handler {
 // Preflight (OPTIONS) is answered here so a client that adds custom
 // headers can still call the API; the methods list is exactly what the
 // mux supports.
+//
+// Access-Control-Expose-Headers names the response headers a browser may
+// read. Only ETag is listed, and only because the conditional-request
+// contract (issue #613) is useless to a browser consumer otherwise: a
+// cross-origin fetch hides every response header the server did not expose,
+// so a page could not read the tag it is asked to send back.
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Expose-Headers", "X-Request-Id")
+		w.Header().Set("Access-Control-Expose-Headers", "ETag")
 		if r.Method == http.MethodOptions {
 			w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
 			if reqHeaders := r.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
@@ -291,9 +257,11 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case err == nil && found:
 			stale := staleJSON(rec, pair, time.Now().UTC())
-			writeJSON(w, r, http.StatusOK, stale)
+			// The record is the response's validator: a client holding
+			// this record can be answered 304 rather than sent the same
+			// body again. See writeHistoryJSON.
+			writeHistoryJSON(w, r, rec, stale)
 			log().Info("corridor measured",
-				"request_id", requestID(r.Context()),
 				"method", r.Method,
 				"path", r.URL.Path,
 				"from", from,
@@ -350,10 +318,9 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 		// is the one place a continuous monitor can quietly betray the
 		// project, by returning a plausible number instead of admitting
 		// it does not currently know.
-		if stale, ok := s.staleFor(ctx, sendAsset.Code, recvAsset.Code, pegBase+"/"+pegQuote); ok {
-			writeJSON(w, r, http.StatusOK, stale)
+		if rec, stale, ok := s.staleFor(ctx, sendAsset.Code, recvAsset.Code, pegBase+"/"+pegQuote); ok {
+			writeHistoryJSON(w, r, rec, stale)
 			log().Info("corridor measured",
-				"request_id", requestID(r.Context()),
 				"method", r.Method,
 				"path", r.URL.Path,
 				"from", from,
@@ -373,18 +340,14 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 					completed = append(completed, d.String())
 				}
 			}
-			timeoutBody := map[string]any{
+			writeJSON(w, r, http.StatusGatewayTimeout, map[string]any{
 				"error": fmt.Sprintf("measuring corridor: timed out after %s with %d of %d rungs completed",
 					budget, len(completed), rungs),
 				"code":            codeUpstreamTimeout,
 				"budget":          budget.String(),
 				"rungs_requested": rungs,
 				"rungs_completed": completed,
-			}
-			if reqID := requestID(r.Context()); reqID != "" {
-				timeoutBody["request_id"] = reqID
-			}
-			writeJSON(w, r, http.StatusGatewayTimeout, timeoutBody)
+			})
 			return
 		}
 		writeError(w, r, status, code, "measuring corridor: "+err.Error())
@@ -393,11 +356,17 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 
 	out := route.ToCorridorJSON(res, pegBase+"/"+pegQuote)
 
-	// Checks run after the measurement and cannot alter it. route.WithFindings
-	// is the only composition point and branches on nothing — see the
-	// composition rule in docs/checks.md.
+	// Checks and metrics run after the measurement and cannot alter it.
+	// route.WithFindings is the only composition point and branches on
+	// nothing — see the composition rule in docs/checks.md.
 	if s.Checks != nil {
-		out = route.WithFindings(out, s.Checks.ForAsset(ctx, recvAsset))
+		out = route.WithFindings(out, s.Checks.ForCorridor(ctx, checks.Corridor{
+			Send:       sendAsset,
+			Receive:    recvAsset,
+			Integrity:  res.Integrity.String(),
+			Underlying: underlyingPair(res),
+			Reference:  res.Reference,
+		}))
 	}
 
 	writeJSON(w, r, http.StatusOK, out)
@@ -410,7 +379,6 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 	// succeeds, not derived from the query parameter.
 	actualLive := true
 	log().Info("corridor measured",
-		"request_id", requestID(r.Context()),
 		"method", r.Method,
 		"path", r.URL.Path,
 		"from", from,
@@ -419,6 +387,19 @@ func (s *Server) handleCorridor(w http.ResponseWriter, r *http.Request) {
 		"live", actualLive,
 		"integrity", out.Integrity,
 		"duration", time.Since(started).Round(time.Millisecond).String())
+}
+
+// underlyingPair names the pair a DERIVATIVE corridor's paths traverse, when
+// the ladder identified exactly one. It exists so a book metric measures the
+// market that actually exists instead of reporting "no book" for a corridor
+// whose liquidity sits one hop away. More than one dependency stays empty:
+// there is no single pair to measure, and guessing one would attribute that
+// market's spread to this corridor.
+func underlyingPair(res *route.LadderResult) asset.Asset {
+	if res == nil || res.Integrity != route.IntegrityDerivative || len(res.DependsOn) != 1 {
+		return asset.Asset{}
+	}
+	return res.DependsOn[0]
 }
 
 func (s *Server) handleAssets(w http.ResponseWriter, r *http.Request) {
@@ -621,6 +602,10 @@ func (s *Server) healthFreshness(ctx context.Context) healthFreshnessJSON {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, r, http.StatusMethodNotAllowed, codeMethodNotAllowed, "only GET and HEAD are supported")
+		return
+	}
 	if err := checkParams(r, "pretty"); err != nil {
 		writeError(w, r, http.StatusBadRequest, codeInvalidQuery, err.Error())
 		return
@@ -754,6 +739,7 @@ func wantsPretty(r *http.Request) bool {
 
 func writeJSON(w http.ResponseWriter, r *http.Request, status int, body any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	enc := json.NewEncoder(w)
 	if wantsPretty(r) {
@@ -763,14 +749,10 @@ func writeJSON(w http.ResponseWriter, r *http.Request, status int, body any) {
 }
 
 func writeError(w http.ResponseWriter, r *http.Request, status int, code, msg string) {
-	body := map[string]string{
+	writeJSON(w, r, status, map[string]string{
 		"error": msg,
 		"code":  code,
-	}
-	if reqID := requestID(r.Context()); reqID != "" {
-		body["request_id"] = reqID
-	}
-	writeJSON(w, r, status, body)
+	})
 }
 
 // staleFor returns the most recent stored run for a corridor, labelled as
@@ -781,12 +763,16 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, code, msg st
 // Serving a different shape would mean every consumer needed two parsers, and
 // the one that forgot would be the one that rendered a six-hour-old reading as
 // current.
-func (s *Server) staleFor(ctx context.Context, send, recv, pair string) (route.CorridorJSON, bool) {
+//
+// The record is returned alongside the document because the response's entity
+// tag is the record's own seal hash. The validator and the body are the same
+// bytes read two ways, and neither can be derived from the other.
+func (s *Server) staleFor(ctx context.Context, send, recv, pair string) (*runstore.Record, route.CorridorJSON, bool) {
 	rec, found, err := s.latestRun(ctx, send, recv)
 	if err != nil || !found {
-		return route.CorridorJSON{}, false
+		return nil, route.CorridorJSON{}, false
 	}
-	return staleJSON(rec, pair, time.Now().UTC()), true
+	return rec, staleJSON(rec, pair, time.Now().UTC()), true
 }
 
 // latestRun reads a corridor's most recent record and separates the three

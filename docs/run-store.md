@@ -2,9 +2,9 @@
 
 A tamper-evident history of corridor measurements.
 
-**Schema version 3.** Implemented by `runstore/`. Version 1 and Version 2
-chains still load and still verify — see [Migration to version 2](#migration-to-version-2)
-and [Migration to version 3](#migration-to-version-3).
+**Schema version 4.** Implemented by `runstore/`. Version 1 through 3 chains
+still load and verify; each migration adds optional fields after the previous
+record shape so old preimages remain unchanged.
 
 ---
 
@@ -37,7 +37,7 @@ This is not a blockchain and makes no distributed-consensus claim.
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "seq": 42,
   "recorded_at": "2026-08-21T22:30:40Z",
   "corridor": "USDC-NGNC",
@@ -79,6 +79,7 @@ This is not a blockchain and makes no distributed-consensus claim.
                     "observed": "bid=1350.1000 ask=1350.6400"}],
      "observed_at": "2026-08-21T22:28:00Z"}
   ],
+  "snapshot": "sha256:8a4e…",
   "prev_hash": "sha256:0000…0000",
   "hash": "sha256:6b1f…"
 }
@@ -202,6 +203,56 @@ nothing: not a single hash in the chain depends on it.
 
 ---
 
+## Path concentration over time
+
+Issue [#197](https://github.com/Wayfare-labs/wayfare/issues/197) (entry 126
+of docs/backlog.md): whether a corridor's executable value is concentrating
+into fewer paths.
+
+**The figure is measured per run, and stored where every metric is.** The
+`fragmentation.paths` metric (`checks.FragmentationMetric`; definition in
+[metrics.md](metrics.md#fragmentationpaths--concentration-of-executable-value-across-paths))
+is a measured quantity like any other, so a sweep that registers it writes it
+into the record's existing `metrics` block. **The record layout does not
+change**: no field is added, `Version` does not move, and every existing hash
+still verifies. A record written before the metric existed simply has no
+reading.
+
+`runstore.FragmentationHistory` returns one reading per stored run, oldest
+first; `runstore.FragmentationOfRecord` reads one record:
+
+- **`determined`** / **`hhi`** — the stored value as written, never
+  re-derived. `hhi` is present only when determined.
+- **`source`** — the stored evidence source: endpoint, pair and probed size.
+- **`reason`** — why a reading is unknown. A run whose record carries no
+  `fragmentation.paths` metric is `not measured`; a run that measured it and
+  could not determine it carries the stored reason; a stored value that does
+  not parse, or is outside (0, 1], is reported as unusable rather than
+  repaired. None of these is ever a zero, and none is dropped to make the
+  series look continuous.
+
+`runstore.FragmentationOf` summarises the chain:
+
+- **`total_runs`**, **`determined_runs`**, **`unknown_runs`** — always
+  present, so a reader can see what the comparison stands on.
+- **`source`** and **`comparable_runs`** — the comparison is made only between
+  determined readings sharing the latest determined reading's source. A
+  reading at 100 USDC and one at 5000 answer different questions, so a
+  history that changed its probe size is not compared across the change.
+- **`first_*`** / **`last_*`** — the earliest and latest comparable readings,
+  with their sequence numbers and timestamps.
+- **`change_hhi`** — `last_hhi − first_hhi`, in `decimal.Decimal`. A measured
+  `"0"` is a finding. It is empty — **unknown, never zero** — when fewer than
+  two comparable readings exist, and **`reason`** says so.
+- **`direction`** — `CONCENTRATING` (the HHI rose), `DISPERSING` (it fell) or
+  `UNCHANGED`: the sign of `change_hhi` and nothing more. It is a comparison
+  of two stored figures, not a trend fit, and says nothing about the runs in
+  between; there is no threshold, and it moves no verdict or integrity state.
+
+Derived on read; appends nothing.
+
+---
+
 ## The preimage rule
 
 ```
@@ -233,7 +284,10 @@ ever written**. A reader verifying last month's history against the new build
 would be told it had been tampered with.
 
 So a shape change is a `Version` bump plus a migration — never a compatible
-change, and never a tidy-up.
+change, and never a tidy-up. Version 4 adds the optional `snapshot` field
+after the Version 3 fields. Earlier records omit it, preserving their original
+JSON preimage and hash; new writes use version 4. This lets existing chains
+continue from their current tip without rewriting or invalidating history.
 
 This is enforced, not merely agreed. `TestRecordHashIsPinned` freezes the hash
 of a fixed record; a purely cosmetic field reorder fails it. The test's own
@@ -314,14 +368,36 @@ Verification, not rewriting, is what makes a mixed chain safe: the new build
 tell a genuine legacy record from a tampered one — and it refuses any other
 version (see [the version-mismatch rule](#the-version-mismatch-rule)).
 
+### Migration to version 4
+
+Version 3 records have no snapshot link. Version 4 adds the optional
+`snapshot` field after every prior record field. When absent, it is omitted
+from JSON, so Version 1 through Version 3 hashes remain unchanged. New records
+written by the monitor carry the content hash of their snapshot artifact.
+
 ### The version-mismatch rule
 
 A record version this build does not recognise is an error, never a best-effort
-parse: `runstore` accepts exactly `1`, `2` and `3`. Relabelling a record to
+parse: `runstore` accepts versions `1` through `4`. Relabelling a record to
 make it parse is falsification, not migration — a record that says `version: 9`
 is a schema the build cannot speak, and guessing at it would hide the mismatch.
 
 ---
+
+## Snapshot artifacts
+
+Scheduled sweeps with a configured data directory store each complete run's
+snapshot beneath `<data>/snapshots/<hex-digest>`. The run record contains the
+`sha256:` digest; the large response bodies stay outside the NDJSON chain.
+The digest covers the exact manifest bytes and each response path and body,
+sorted by path and length-framed before hashing. Snapshot loading also verifies
+each response against its manifest `body_sha256`.
+
+This is content-addressed storage: an artifact's directory name is derived
+from its content, and a record never depends on a timestamp-based lookup.
+`-verify-store` checks each referenced artifact when it is present. A missing
+artifact does not invalidate the hash chain, but the original inputs are no
+longer available for reproducing that run.
 
 ## Storage
 
@@ -503,8 +579,9 @@ modify the store.
 ### Backups
 
 The chain proves nothing was edited. It does **not** survive the volume dying.
-Copy the NDJSON files off-box on a schedule, and verify after restoring —
-a backup nobody has restored from is a hypothesis. See
+Copy both the NDJSON files and the `snapshots/` artifact directory off-box on a
+schedule, and verify after restoring — a backup nobody has restored from is a
+hypothesis. See
 [deployment.md](deployment.md).
 
 ---

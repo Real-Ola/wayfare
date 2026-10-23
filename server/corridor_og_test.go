@@ -365,16 +365,16 @@ func TestCorridorImageWireShapeFromStoredRecord(t *testing.T) {
 	}
 
 	doc := route.NewCorridorImage(route.CorridorJSON{
-		SendAsset:    route.AssetJSON{Code: "USDC"},
-		ReceiveAsset: route.AssetJSON{Code: "NGNC"},
-		Integrity:    "DIRECT",
-		Floor:        "27.15",
-		FloorSize:    "0.1",
-		WorstLoss:    "97.52",
-		WorstSize:    "5000",
-		ReferenceMid: "1349.67",
+		SendAsset:       route.AssetJSON{Code: "USDC"},
+		ReceiveAsset:    route.AssetJSON{Code: "NGNC"},
+		Integrity:       "DIRECT",
+		Floor:           "27.15",
+		FloorSize:       "0.1",
+		WorstLoss:       "97.52",
+		WorstSize:       "5000",
+		ReferenceMid:    "1349.67",
 		ReferenceSource: "exchangerate-api",
-		MeasuredAt:   now.Format(time.RFC3339),
+		MeasuredAt:      now.Format(time.RFC3339),
 		Stale: &route.StaleJSON{
 			RecordedAt: now.Format(time.RFC3339),
 		},

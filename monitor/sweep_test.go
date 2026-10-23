@@ -201,7 +201,6 @@ func TestPartialSweepRecordsSuccessfulCorridors(t *testing.T) {
 	staticRef := refrate.NewStatic(map[string]decimal.Decimal{
 		"USD/NGN": decimal.RequireFromString("1350.2568"),
 		"USD/GHS": decimal.RequireFromString("11.0912"),
-		"USD/KES": decimal.RequireFromString("129.4263"),
 	})
 
 	s := &Scheduler{
